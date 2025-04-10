@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 import argparse
-import time
-from threading import Thread
-from typing import Tuple
+import fcntl
+import os
+from io import TextIOWrapper
+from os import close
 
+import pty
 import pylxd
 import random
 import redis
@@ -12,8 +14,26 @@ import sys
 import subprocess
 import string
 import threading
+import time
+
+# TODO implement proper locking to avoid race conditions
 
 MAX_INSTANCES = 10
+
+# Create a multiprocess lock
+class Lock:
+    def __init__(self, filename: str):
+        self.filename = filename
+        self.f = open(filename, "w+")
+
+    def __del__(self):
+        self.f.close()
+
+    def acquire(self):
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+
+    def release(self):
+        fcntl.flock(self.f, fcntl.LOCK_UN)
 
 # Use this signal handler before we do anything substantial
 def base_handler(sig, frame):
@@ -22,46 +42,37 @@ def base_handler(sig, frame):
 def parse_args():
     parser = argparse.ArgumentParser(description="LXD Shell")
     parser.add_argument("lab", type=str, help="The name of the lab to run")
-    parser.add_argument("--time", "-t", type=int, default=60, help="The number of minutes a lab can run for")
+    parser.add_argument("--timeout", "-t", type=int, default=60, help="The number of minutes a lab can run for")
     parser.add_argument("--endpoint", "-e", type=str, default=None, help="The LXD server endpoint")
     parser.add_argument("--client-cert", "-c", type=str, required=False, help="The client cert for authentication")
     parser.add_argument("--client-key", "-k", type=str, required=False, help="The client key for authentication")
     parser.add_argument("--server-cert", "-s", type=str, default=False, required=False, help="The server cert for verification")
     return vars(parser.parse_args())
 
-# def setup_redis(client: redis.Redis):
-#     client.set("max_instances", 10)
-
-def read_output(shell: subprocess.Popen):
-    while True:
-        output = shell.stdout.readline()
-        if output:
-            print(output.decode(), end='')
-        elif shell.poll() is not None:
-            break
-
-def write_input(shell: subprocess.Popen):
-    while True:
-        user_input = input()
-        if user_input:
-            shell.stdin.write(user_input + "\n")
-            shell.stdin.flush()
-
-
-def create_instance(lxd_client: pylxd.Client, redis_client: redis.Redis, args: dict) -> tuple[str, int]:
+def create_instance(lock: Lock, lxd_client: pylxd.Client, redis_client: redis.Redis, args: dict) -> str:
     instance_name = f"lab-{args['lab']}-{''.join(random.choice(string.ascii_lowercase) for i in range(6))}"
+    lock.acquire()
+    # Regenerate the name as long as we need to get a unique one
+    while redis_client.get(instance_name):
+        instance_name = f"lab-{args['lab']}-{''.join(random.choice(string.ascii_lowercase) for i in range(6))}"
+    lock.release()
 
     # Add a sig handler for cleanup since we might not finish
     def handle(sig, frame):
-        cleanup(lxd_client, redis_client, instance_name)
+        cleanup(lock, lxd_client, redis_client, instance_name)
 
     signal.signal(signal.SIGINT, lambda sig, frame : None)
     signal.signal(signal.SIGTERM, handle)
 
     # Add the instance to the DB
-    if redis_client.llen("instances") < MAX_INSTANCES:
-        index = redis_client.lpush("instances", instance_name)
+    lock.acquire()
+    num_instances = int(redis_client.get("num_instances"))
+    if num_instances < int(redis_client.get("max_instances")):
+        # Add a new instance
+        redis_client.set(instance_name, 1)
+        redis_client.set("num_instances", num_instances + 1)
     else:
+        lock.release()
         print("Too many instances")
         sys.exit(1)
 
@@ -83,49 +94,67 @@ def create_instance(lxd_client: pylxd.Client, redis_client: redis.Redis, args: d
         },
         wait=True
     )
+    lock.release()
     instance.start(wait=True)
 
-    return instance_name, index
+    return instance_name
 
-def spawn_shell(instance: str) -> tuple[Thread, Thread]:
-    shell = subprocess.Popen(
-        ["lxc", "shell", instance],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text = True,
-        bufsize = 1,
-        universal_newlines = True
-    )
+def read_output(shell: subprocess.Popen):
+    while True:
+        output = shell.stdout.readline()
+        if output:
+            print(output, end='')
+        elif shell.poll() is not None:
+            return
 
-    # Create the read thread
-    read_thread = threading.Thread(target=read_output, args=(shell,))
-    # Ensure the thread exits when the main program exits
-    read_thread.daemon = True
-    read_thread.start()
+def write_input(shell: subprocess.Popen):
+    while True:
+        try:
+            user_input = input()
+        except EOFError:
+            shell.send_signal(signal.SIGTERM)
+            return
+        if user_input:
+            shell.stdin.write(user_input + "\n")
+            shell.stdin.flush()
 
-    # Create the write thread
-    write_thread = threading.Thread(target=write_input, args=(shell,))
-    # Ensure the thread exits when the main program exits
-    write_thread.daemon = True
-    write_thread.start()
+def clean_exit():
+    print("Gracefully shutting down")
+    sys.exit(0)
 
-    return read_thread, write_thread
 
-def cleanup(lxd_client: pylxd.Client, redis_client: redis.Redis, name: str, index: int):
-    redis_instance_name = redis_client.lindex("instances", index)
-    # The instance must not exist yet, so just exit
-    if redis_instance_name != name:
-        return
+def cleanup(lock: Lock, lxd_client: pylxd.Client, redis_client: redis.Redis, name: str):
+    lock.acquire()
+    # The instance doesn't exist yet, so just exit
+    if not redis_client.get(name):
+        lock.release()
+        clean_exit()
 
-    # TODO don't use a redis list, it's better to have a counter and separate variables
-    redis_client.l
+    # Remove the instance from redis because we don't need it anymore
+    redis_client.delete(name)
+    redis_client.set("num_instances", int(redis_client.get("num_instances")) - 1)
 
     # Get the instance
     instance = lxd_client.instances.get(name)
+    lock.release()
     if instance is None:
+        clean_exit()
 
+    # Delete the instance
+    instance.stop(wait=True)
+    try:
+        instance.delete(wait=True)
+    except AttributeError:
+        pass
+    clean_exit()
 
+def setup(lock: Lock, redis_client: redis.Redis):
+    lock.acquire()
+    if redis_client.get("max_instances") is None:
+        redis_client.set("max_instances", MAX_INSTANCES)
+    if redis_client.get("num_instances") is None:
+        redis_client.set("num_instances", 0)
+    lock.release()
 
 def main():
     signal.signal(signal.SIGINT, base_handler)
@@ -145,29 +174,30 @@ def main():
             verify=args["server_cert"]
         )
 
+    # Define a lock on our resources
+    lock = Lock("/tmp/lxd_shell_lock")
+
     # Setup Redis
     redis_client = redis.Redis(host="localhost", port=6379, decode_responses=True)
-    # setup_redis(REDIS_CLIENT)
+    setup(lock, redis_client)
 
     # Create the instance
-    instance, index = create_instance(lxd_client, redis_client, args)
-
-    # Spawn a shell for the instance
-    read_thread, write_thread = spawn_shell(instance)
+    instance = create_instance(lock, lxd_client, redis_client, args)
 
     # Create a timer so that the instance must be stopped after configured timeout
     def timeout():
         time.sleep(args["timeout"]*60)
-        cleanup(lxd_client, redis_client, instance, index)
+        cleanup(lock, lxd_client, redis_client, instance)
 
     timeout_thread = threading.Thread(target=timeout)
+    timeout_thread.daemon = True
     timeout_thread.start()
 
-    # Wait for the write thread to finish
-    write_thread.join()
+    # Spawn a shell for the instance
+    pty.spawn(["lxc", "shell", instance])
 
     # Call the cleanup since we are done with the instance
-    cleanup(lxd_client, redis_client, instance, index)
+    cleanup(lock, lxd_client, redis_client, instance)
 
 
 if __name__ == "__main__":
