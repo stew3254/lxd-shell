@@ -16,8 +16,6 @@ import string
 import threading
 import time
 
-# TODO implement proper locking to avoid race conditions
-
 MAX_INSTANCES = 10
 
 # Create a multiprocess lock
@@ -73,7 +71,7 @@ def create_instance(lock: Lock, lxd_client: pylxd.Client, redis_client: redis.Re
         redis_client.set("num_instances", num_instances + 1)
     else:
         lock.release()
-        print("Too many instances")
+        print("Too many instances, please try again later")
         sys.exit(1)
 
     # Create and start the instance
@@ -181,6 +179,8 @@ def main():
     redis_client = redis.Redis(host="localhost", port=6379, decode_responses=True)
     setup(lock, redis_client)
 
+    print("Please wait while we initialize your environment. This may take up to a minute")
+
     # Create the instance
     instance = create_instance(lock, lxd_client, redis_client, args)
 
@@ -194,6 +194,7 @@ def main():
     timeout_thread.start()
 
     # Spawn a shell for the instance
+    # TODO make this better where it can actively resize the TTY and pass in ENV vars
     pty.spawn(["lxc", "shell", instance])
 
     # Call the cleanup since we are done with the instance
